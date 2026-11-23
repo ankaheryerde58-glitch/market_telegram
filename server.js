@@ -1,8 +1,3 @@
-/* =====================================================================
-   ANKA MARKET — Telegram Bot
-   -----------------------------------------------------------------
-   Yetkili ve yasal dijital ürünlerin satıldığı, TL bakiye sistemi ve
-   IBAN/EFT bildirimli ödeme akışı olan bir Telegram mağaza botu.
 
    ÖNEMLİ GÜVENLİK KURALLARI:
    - BOT_TOKEN, ADMIN_CHAT_ID, SMS_TC_API_KEY, IBAN SADECE Render
@@ -128,36 +123,14 @@ function findNumberProduct(id) { return NUMBER_CATALOG.find(p => p.id === id); }
 // Aynı anda aynı kullanıcının çift tıklayıp iki numara birden almasını engeller.
 const numberBuyLocks = new Set();
 
-if (!BOT_TOKEN) {
-    throw new Error('BOT_TOKEN ortam değişkeni gerekli (Render Environment Variables).');
-}
-if (!ADMIN_CHAT_ID) {
-    throw new Error('ADMIN_CHAT_ID ortam değişkeni gerekli (Render Environment Variables).');
+if (!BOT_TOKEN || !ADMIN_BOT_TOKEN || !ADMIN_ID) {
+  throw new Error("BOT_TOKEN, ADMIN_BOT_TOKEN ve ADMIN_ID gerekli.");
 }
 
-/* ---------------------------------------------------------------------
-   2) KALICI VERİTABANI (JSON dosyası)
-   -----------------------------------------------------------------
-   NOT: Render'ın ücretsiz/standart servislerinde disk EPHEMERAL'dir
-   (yeniden deploy'da sıfırlanabilir). Veritabanının gerçek anlamda
-   kalıcı olması (restart/redeploy sonrası da kaybolmaması) için bu
-   serviste bir Render "Persistent Disk" (Disk) bağlanmalı ve DB_PATH
-   o disk yoluna ayarlanmalıdır. Persistent Disk bağlanmadan sadece
-   "servis yeniden başlatma" (restart, redeploy değil) sırasında veri
-   korunur; yeni bir deploy dosya sistemini sıfırlayabilir.
-   --------------------------------------------------------------------- */
-const DB_PATH = process.env.DB_PATH || path.join(__dirname, 'data', 'db.json');
+const adminId = Number(ADMIN_ID);
 
-function emptyDB() {
-    return {
-        users: {},       // chatId -> { chatId, username, firstName, balance, createdAt, banned }
-        products: {},     // id -> { id, name, description, price, stock, createdAt }
-        orders: {},       // id -> { id, userId, productId, productName, price, status, createdAt, decidedAt }
-        payments: {},     // id -> { id, userId, amount, senderName, status, createdAt, decidedAt }
-        transactions: [], // { id, userId, type, amount, note, createdAt }
-        adminLog: [],      // { ts, action, detail }
-        seq: { product: 0, order: 0, payment: 0, tx: 0 }
-    };
+if (!Number.isSafeInteger(adminId) || adminId <= 0) {
+  throw new Error("ADMIN_ID hatalı.");
 }
 
 let db = emptyDB();
@@ -279,53 +252,58 @@ app.listen(PORT, '0.0.0.0', () => {
     console.log('[http] ANKA MARKET sağlık kontrolü ' + PORT + ' portunda dinliyor.');
 });
 
-/* ---------------------------------------------------------------------
-   5) TELEGRAM BOT
-   --------------------------------------------------------------------- */
-const bot = new TelegramBot(BOT_TOKEN, { polling: true });
-
-bot.on('polling_error', (error) => {
-    // Secret sızdırmamak için sadece hata mesajını yazdırıyoruz.
-    console.error('[telegram] Bağlantı hatası: ' + (error && error.message ? error.message : error));
+server.listen(Number(PORT), "0.0.0.0", () => {
+  console.log("ANKA MARKET HTTP aktif.");
 });
 
-bot.setMyCommands([
-    { command: 'start', description: 'ANKA MARKET\'i başlat' },
-    { command: 'admin', description: 'Yönetim paneli (sadece admin)' },
-    { command: 'iptal', description: 'Sürmekte olan işlemi iptal et' }
-]).catch(() => {});
+// DATABASE
+fs.mkdirSync(path.dirname(path.resolve(DB_PATH)), { recursive: true });
 
-/* Çok adımlı akışlar için durum makinesi: chatId -> { action, data } */
-const userStates = new Map();
-function setState(chatId, action, data) { userStates.set(String(chatId), { action: action, data: data || {} }); }
-function getState(chatId) { return userStates.get(String(chatId)); }
-function clearState(chatId) { userStates.delete(String(chatId)); }
+const db = new Database(DB_PATH);
+db.pragma("journal_mode = WAL");
 
-/* ---------------------------------------------------------------------
-   6) MÜŞTERİ MENÜSÜ
-   --------------------------------------------------------------------- */
-const MENU = {
-    URUNLER: '🛍️ Ürünler',
-    BAKIYE: '💰 Bakiye yükle',
-    SIPARISLER: '📦 Siparişlerim',
-    HESABIM: '👤 Hesabım',
-    GECMIS: '🧾 İşlem geçmişim',
-    ADMIN_ILETISIM: '💬 Admin ile iletişim',
-    WEBSITE: '🌐 Web sitemiz'
+db.exec(`
+CREATE TABLE IF NOT EXISTS users (
+  id INTEGER PRIMARY KEY,
+  username TEXT,
+  first_name TEXT,
+  balance INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS payments (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id INTEGER NOT NULL,
+  amount INTEGER NOT NULL,
+  status TEXT DEFAULT 'pending',
+  created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+  reviewed_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS transactions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id INTEGER NOT NULL,
+  amount INTEGER NOT NULL,
+  type TEXT NOT NULL,
+  reference_id INTEGER,
+  created_at TEXT DEFAULT CURRENT_TIMESTAMP
+);
+`);
+
+const customerBot = new Telegraf(BOT_TOKEN);
+const adminBot = new Telegraf(ADMIN_BOT_TOKEN);
+const sessions = new Map();
+
+const BRAND = "✦ A N K A   M A R K E T ✦";
+
+const countries = {
+  us: { flag: "🇺🇸", name: "ABD", description: "Amerika Birleşik Devletleri" },
+  co: { flag: "🇨🇴", name: "KOLOMBİYA", description: "Kolombiya" },
+  tr: { flag: "🇹🇷", name: "TÜRKİYE", description: "Türkiye" }
 };
 
-function mainMenuKeyboard() {
-    return {
-        reply_markup: {
-            keyboard: [
-                [MENU.URUNLER, MENU.BAKIYE],
-                [MENU.SIPARISLER, MENU.HESABIM],
-                [MENU.GECMIS, MENU.ADMIN_ILETISIM],
-                [MENU.WEBSITE]
-            ],
-            resize_keyboard: true
-        }
-    };
+function money(amount) {
+  return (amount / 100).toFixed(2) + " TL";
 }
 
 /* ---------------------------------------------------------------------
@@ -397,49 +375,17 @@ async function showProducts(chatId) {
     }
 }
 
-bot.on('callback_query', async (query) => {
-    const data = query.data || '';
-    const chatId = query.message.chat.id;
+function getUser(id) {
+  return db.prepare("SELECT * FROM users WHERE id=?").get(id);
+}
 
-    try {
-        if (data.startsWith('order:')) {
-            const productId = data.slice('order:'.length);
-            const product = db.products[productId];
-            if (!product) {
-                return bot.answerCallbackQuery(query.id, { text: 'Ürün bulunamadı.' });
-            }
-            if (product.stock <= 0) {
-                return bot.answerCallbackQuery(query.id, { text: 'Üzgünüz, stok tükendi.' });
-            }
-            const user = getOrCreateUser(Object.assign({ chatId: chatId }, query.from));
-            if ((user.balance || 0) < product.price) {
-                await bot.answerCallbackQuery(query.id, { text: 'Bakiyen yetersiz.' });
-                await bot.sendMessage(chatId, '❌ Bakiyen yetersiz. Mevcut bakiye: ' + fmtMoney(user.balance) + '\nGerekli: ' + fmtMoney(product.price) + '\n\n💰 Bakiye yükle menüsünden bakiyeni yükleyebilirsin.');
-                return;
-            }
-            // Satın alma işlemi
-            user.balance = Number((user.balance - product.price).toFixed(2));
-            product.stock -= 1;
-            db.seq.order += 1;
-            const order = {
-                id: 'o' + db.seq.order,
-                userId: user.chatId,
-                productId: product.id,
-                productName: product.name,
-                price: product.price,
-                status: 'beklemede',
-                createdAt: nowIso(),
-                decidedAt: null
-            };
-            db.orders[order.id] = order;
-            logTx(user.chatId, 'satin_alma', -product.price, product.name + ' (Sipariş ' + order.id + ')');
-            persist();
+function isAdmin(ctx) {
+  return ctx.from && ctx.from.id === adminId;
+}
 
-            await bot.answerCallbackQuery(query.id, { text: 'Siparişin alındı!' });
-            await bot.sendMessage(chatId, '✅ Siparişin alındı!\n\nÜrün: ' + product.name + '\nTutar: ' + fmtMoney(product.price) + '\nSipariş No: ' + order.id + '\nDurum: Beklemede (yönetici onayı/teslimatı bekleniyor)\n\nKalan bakiyen: ' + fmtMoney(user.balance));
-            await bot.sendMessage(ADMIN_CHAT_ID, '🛒 *Yeni sipariş*\nMüşteri: ' + userLabel(user) + '\nÜrün: ' + product.name + '\nTutar: ' + fmtMoney(product.price) + '\nSipariş No: ' + order.id, { parse_mode: 'Markdown' });
-            return;
-        }
+function mainMenu(userId) {
+  const user = getUser(userId);
+  const balance = user ? money(user.balance) : "0.00 TL";
 
         if (data.startsWith('buynum:')) {
             const productId = data.slice('buynum:'.length);
@@ -501,73 +447,42 @@ bot.on('callback_query', async (query) => {
             if (!payment) return bot.answerCallbackQuery(query.id, { text: 'Talep bulunamadı.' });
             if (payment.status !== 'beklemede') return bot.answerCallbackQuery(query.id, { text: 'Bu talep zaten işlenmiş.' });
 
-            const user = db.users[payment.userId];
-            if (approve) {
-                payment.status = 'onaylandı';
-                payment.decidedAt = nowIso();
-                if (user) {
-                    user.balance = Number(((user.balance || 0) + payment.amount).toFixed(2));
-                    logTx(user.chatId, 'bakiye_yukleme', payment.amount, 'IBAN/EFT - Gönderen: ' + payment.senderName + ' (Talep ' + payment.id + ')');
-                }
-                logAdmin('odeme_onay', payment.id + ' / ' + fmtMoney(payment.amount) + ' / ' + userLabel(user));
-                persist();
-                await bot.answerCallbackQuery(query.id, { text: 'Onaylandı.' });
-                await bot.editMessageText((query.message.text || '') + '\n\n✅ ONAYLANDI', { chat_id: chatId, message_id: query.message.message_id });
-                if (user) await bot.sendMessage(user.chatId, '✅ Bakiye yükleme talebin onaylandı!\nYüklenen: ' + fmtMoney(payment.amount) + '\nGüncel bakiyen: ' + fmtMoney(user.balance));
-            } else {
-                payment.status = 'reddedildi';
-                payment.decidedAt = nowIso();
-                logAdmin('odeme_red', payment.id + ' / ' + fmtMoney(payment.amount) + ' / ' + userLabel(user));
-                persist();
-                await bot.answerCallbackQuery(query.id, { text: 'Reddedildi.' });
-                await bot.editMessageText((query.message.text || '') + '\n\n❌ REDDEDİLDİ', { chat_id: chatId, message_id: query.message.message_id });
-                if (user) await bot.sendMessage(user.chatId, '❌ Bakiye yükleme talebin reddedildi. Detaylı bilgi için "💬 Admin ile iletişim" menüsünü kullanabilirsin.');
-            }
-            return;
-        }
+function backMenu() {
+  return Markup.inlineKeyboard([
+    [Markup.button.callback("◀ ANA MENÜ", "home")]
+  ]);
+}
 
-        if (data.startsWith('order_done:') || data.startsWith('order_cancel:')) {
-            if (!isAdmin(chatId)) {
-                return bot.answerCallbackQuery(query.id, { text: 'Bu işlem sadece yöneticiye özeldir.' });
-            }
-            const done = data.startsWith('order_done:');
-            const orderId = data.slice(data.indexOf(':') + 1);
-            const order = db.orders[orderId];
-            if (!order) return bot.answerCallbackQuery(query.id, { text: 'Sipariş bulunamadı.' });
-            if (order.status !== 'beklemede') return bot.answerCallbackQuery(query.id, { text: 'Bu sipariş zaten işlenmiş.' });
+async function showHome(ctx) {
+  saveUser(ctx.from);
+  const user = getUser(ctx.from.id);
 
-            const user = db.users[order.userId];
-            if (done) {
-                order.status = 'tamamlandı';
-                order.decidedAt = nowIso();
-                logAdmin('siparis_tamamlandi', order.id + ' / ' + userLabel(user));
-                persist();
-                await bot.answerCallbackQuery(query.id, { text: 'Tamamlandı olarak işaretlendi.' });
-                if (user) await bot.sendMessage(user.chatId, '📦 Siparişin tamamlandı!\nSipariş No: ' + order.id + '\nÜrün: ' + order.productName);
-            } else {
-                order.status = 'iptal';
-                order.decidedAt = nowIso();
-                if (user) {
-                    user.balance = Number(((user.balance || 0) + order.price).toFixed(2));
-                    logTx(user.chatId, 'iade', order.price, 'Sipariş iptali - ' + order.productName + ' (' + order.id + ')');
-                }
-                logAdmin('siparis_iptal', order.id + ' / ' + userLabel(user));
-                persist();
-                await bot.answerCallbackQuery(query.id, { text: 'İptal edildi, bakiye iade edildi.' });
-                if (user) await bot.sendMessage(user.chatId, '❌ Siparişin iptal edildi ve ' + fmtMoney(order.price) + ' bakiyene iade edildi.\nSipariş No: ' + order.id);
-            }
-            return;
-        }
+  await ctx.reply(
+`${BRAND}
 
-        if (data.startsWith('admin:')) {
-            return handleAdminCallback(query);
-        }
+━━━━━━━━━━━━━━━━━━
 
-        await bot.answerCallbackQuery(query.id, { text: 'Bilinmeyen işlem.' });
-    } catch (err) {
-        console.error('[callback_query] Hata: ' + err.message);
-        try { await bot.answerCallbackQuery(query.id, { text: 'Bir hata oluştu, tekrar dene.' }); } catch (e2) {}
-    }
+👋 Hoş geldin, ${ctx.from.first_name || "Müşteri"}!
+
+Premium dijital mağazana hoş geldin.
+
+👛 CÜZDAN BAKİYESİ
+💰 ${money(user.balance)}
+
+━━━━━━━━━━━━━━━━━━
+
+📱 Sanal numara kategorilerini incele.
+💳 Bakiyeni güvenle yükle.
+📋 İşlemlerini takip et.
+
+Bir işlem seçerek devam et.`,
+    mainMenu(ctx.from.id)
+  );
+}
+
+// CUSTOMER START
+customerBot.start(async (ctx) => {
+  await showHome(ctx);
 });
 
 /* ---------------------------------------------------------------------
@@ -763,56 +678,36 @@ async function startTopup(chatId) {
         'İptal etmek için /iptal yaz.',
         { parse_mode: 'Markdown' }
     );
+  });
 }
 
-/* ---------------------------------------------------------------------
-   10) GENEL MESAJ İŞLEYİCİ (menü + durum makinesi)
-   --------------------------------------------------------------------- */
-bot.on('message', async (msg) => {
-    if (!msg.text || msg.text.startsWith('/start') || msg.text.startsWith('/iptal')) return;
-    const chatId = msg.chat.id;
-    const text = msg.text.trim();
-    const user = getOrCreateUser(Object.assign({ chatId: chatId }, msg.from));
+// WALLET
+customerBot.action("wallet", async (ctx) => {
+  await ctx.answerCbQuery();
+  saveUser(ctx.from);
 
-    if (text === '/admin') {
-        return handleAdminMenu(chatId);
-    }
+  const user = getUser(ctx.from.id);
 
-    // --- Çok adımlı akışlar ---
-    const state = getState(chatId);
-    if (state) {
-        try {
-            await handleStatefulMessage(chatId, text, state, user, msg);
-        } catch (e) {
-            console.error('[state] Hata: ' + e.message);
-            clearState(chatId);
-            await bot.sendMessage(chatId, 'Beklenmeyen bir hata oluştu, işlem iptal edildi.', mainMenuKeyboard());
-        }
-        return;
-    }
+  await ctx.reply(
+`${BRAND}
 
-    // --- Ana menü ---
-    switch (text) {
-        case MENU.URUNLER:
-            return showProducts(chatId);
-        case MENU.BAKIYE:
-            return startTopup(chatId);
-        case MENU.SIPARISLER:
-            return showMyOrders(chatId, user);
-        case MENU.HESABIM:
-            return showAccount(chatId, user);
-        case MENU.GECMIS:
-            return showHistory(chatId, user);
-        case MENU.ADMIN_ILETISIM:
-            setState(chatId, 'awaiting_admin_message', {});
-            return bot.sendMessage(chatId, '💬 Yöneticiye iletmek istediğin mesajı yaz. (İptal için /iptal)');
-        case MENU.WEBSITE:
-            return bot.sendMessage(chatId, '🌐 Web sitemiz:', {
-                reply_markup: { inline_keyboard: [[{ text: 'ankaysms.site', url: SITE_URL }]] }
-            });
-        default:
-            return; // bilinmeyen metin, sessiz geç
-    }
+👛 CÜZDANIM
+
+━━━━━━━━━━━━━━━━━━
+
+💰 Kullanılabilir bakiye
+
+${money(user.balance)}
+
+━━━━━━━━━━━━━━━━━━
+
+Bakiye yüklemek veya işlemlerini görmek için aşağıdan seçim yap.`,
+    Markup.inlineKeyboard([
+      [Markup.button.callback("💳 BAKİYE YÜKLE", "deposit")],
+      [Markup.button.callback("📋 İŞLEM GEÇMİŞİ", "history")],
+      [Markup.button.callback("◀ ANA MENÜ", "home")]
+    ])
+  );
 });
 
 function orderStatusLabel(status) {
@@ -859,83 +754,26 @@ async function showHistory(chatId, user) {
     await bot.sendMessage(chatId, BRAND_HEADER + '\n🧾 *İşlem Geçmişim*\n\n' + lines.join('\n\n'), { parse_mode: 'Markdown' });
 }
 
-/* ---------------------------------------------------------------------
-   11) DURUM MAKİNESİ İŞLEYİCİSİ (müşteri + admin ortak)
-   --------------------------------------------------------------------- */
-async function handleStatefulMessage(chatId, text, state, user, msg) {
-    switch (state.action) {
+💳 BAKİYE YÜKLEME
 
-        /* ---- Müşteri: bakiye yükleme tutarı ---- */
-        case 'awaiting_topup_amount': {
-            const amount = Number(String(text).replace(',', '.').replace(/[^0-9.]/g, ''));
-            if (!amount || amount <= 0) {
-                return bot.sendMessage(chatId, 'Geçerli bir tutar yaz (sadece sayı, örn: 250). İptal için /iptal.');
-            }
-            setState(chatId, 'awaiting_topup_name', { amount: Number(amount.toFixed(2)) });
-            return bot.sendMessage(chatId, 'Tutar: ' + fmtMoney(amount) + '\n\nŞimdi EFT/Havaleyi gönderen kişinin *ad soyadını* yaz.', { parse_mode: 'Markdown' });
-        }
+━━━━━━━━━━━━━━━━━━
 
-        /* ---- Müşteri: bakiye yükleme gönderen ad-soyad ---- */
-        case 'awaiting_topup_name': {
-            const senderName = text.slice(0, 80);
-            const amount = state.data.amount;
-            db.seq.payment += 1;
-            const payment = {
-                id: 'p' + db.seq.payment,
-                userId: String(user.chatId),
-                amount: amount,
-                senderName: senderName,
-                status: 'beklemede',
-                createdAt: nowIso(),
-                decidedAt: null
-            };
-            db.payments[payment.id] = payment;
-            persist();
-            clearState(chatId);
-            await bot.sendMessage(chatId, '✅ Bakiye yükleme talebin alındı!\n\nTutar: ' + fmtMoney(amount) + '\nGönderen: ' + senderName + '\nTalep No: ' + payment.id + '\n\nYönetici onayından sonra bakiyen otomatik güncellenecek.', mainMenuKeyboard());
-            await bot.sendMessage(ADMIN_CHAT_ID,
-                '💰 *Yeni bakiye yükleme talebi*\nMüşteri: ' + userLabel(user) + '\nTutar: ' + fmtMoney(amount) + '\nGönderen (beyan): ' + senderName + '\nTalep No: ' + payment.id,
-                {
-                    parse_mode: 'Markdown',
-                    reply_markup: { inline_keyboard: [[
-                        { text: '✅ Onayla', callback_data: 'pay_approve:' + payment.id },
-                        { text: '❌ Reddet', callback_data: 'pay_reject:' + payment.id }
-                    ]] }
-                }
-            );
-            return;
-        }
+👤 Hesap sahibi: Resul Sakal
 
-        /* ---- Müşteri: admin ile iletişim mesajı ---- */
-        case 'awaiting_admin_message': {
-            clearState(chatId);
-            await bot.sendMessage(ADMIN_CHAT_ID, '💬 *Müşteri mesajı*\nKimden: ' + userLabel(user) + '\n\n' + text, { parse_mode: 'Markdown' });
-            await bot.sendMessage(chatId, '✅ Mesajın yöneticiye iletildi. En kısa sürede sana dönüş yapılacak.', mainMenuKeyboard());
-            return;
-        }
+🏦 IBAN:
+TR62 0006 2000 5000 0006 8107 73
 
-        default:
-            return handleAdminStatefulMessage(chatId, text, state, msg);
-    }
-}
+━━━━━━━━━━━━━━━━━━
 
-/* ---------------------------------------------------------------------
-   12) ADMİN: /mesaj komutu (müşteriye yanıt)
-   --------------------------------------------------------------------- */
-bot.onText(/^\/mesaj\s+(\S+)\s+([\s\S]+)/, async (msg, match) => {
-    if (!isAdmin(msg.chat.id)) return;
-    const targetId = match[1];
-    const text = match[2];
-    const target = db.users[targetId];
-    if (!target) return bot.sendMessage(msg.chat.id, 'Bu ID\'de kayıtlı kullanıcı bulunamadı: ' + targetId);
-    try {
-        await bot.sendMessage(targetId, '💬 *Yöneticiden mesaj:*\n\n' + text, { parse_mode: 'Markdown' });
-        logAdmin('musteriye_mesaj', targetId + ': ' + text.slice(0, 120));
-        persist();
-        await bot.sendMessage(msg.chat.id, '✅ Mesaj gönderildi: ' + userLabel(target));
-    } catch (e) {
-        await bot.sendMessage(msg.chat.id, '❌ Mesaj gönderilemedi: ' + e.message);
-    }
+Yüklemek istediğin tutarı TL olarak gönder.
+
+Örnek: 500
+
+Minimum yükleme: 50 TL
+
+İşlemi iptal etmek için /iptal yaz.`,
+    backMenu()
+  );
 });
 
 /* ---------------------------------------------------------------------
@@ -1121,76 +959,328 @@ bot.onText(/^\/bakiye\s+(\S+)\s+([+-]?\d+(?:[.,]\d+)?)/, async (msg, match) => {
     try { await bot.sendMessage(user.chatId, '🛠️ Hesap bakiyende güncelleme yapıldı: ' + (delta >= 0 ? '+' : '') + fmtMoney(delta) + '\nGüncel bakiyen: ' + fmtMoney(user.balance)); } catch (e) {}
 });
 
-/* ---------------------------------------------------------------------
-   14) ADMİN DURUM MAKİNESİ (ürün ekleme / düzenleme akışları)
-   --------------------------------------------------------------------- */
-async function handleAdminStatefulMessage(chatId, text, state, msg) {
-    if (!isAdmin(chatId)) { clearState(chatId); return; }
+// TEXT HANDLER
+customerBot.on("text", async (ctx) => {
+  const session = sessions.get(ctx.from.id);
 
-    switch (state.action) {
-        case 'admin_addproduct_name':
-            setState(chatId, 'admin_addproduct_desc', { name: text.slice(0, 120) });
-            return bot.sendMessage(chatId, 'Ürün açıklamasını yaz: (geçmek için "-" yaz)');
+  if (!session) return;
 
-        case 'admin_addproduct_desc': {
-            const description = text === '-' ? '' : text.slice(0, 500);
-            setState(chatId, 'admin_addproduct_price', Object.assign({}, state.data, { description: description }));
-            return bot.sendMessage(chatId, 'Fiyatını TL olarak yaz (sadece sayı, örn: 199):');
-        }
+  if (session.step === "amount") {
+    const amount = Number(ctx.message.text.trim());
 
-        case 'admin_addproduct_price': {
-            const price = Number(String(text).replace(',', '.').replace(/[^0-9.]/g, ''));
-            if (!price || price <= 0) return bot.sendMessage(chatId, 'Geçersiz fiyat. Sadece sayı yaz (örn: 199):');
-            setState(chatId, 'admin_addproduct_stock', Object.assign({}, state.data, { price: Number(price.toFixed(2)) }));
-            return bot.sendMessage(chatId, 'Stok adedini yaz (sadece sayı, örn: 10):');
-        }
-
-        case 'admin_addproduct_stock': {
-            const stock = parseInt(String(text).replace(/[^0-9]/g, ''), 10);
-            if (isNaN(stock) || stock < 0) return bot.sendMessage(chatId, 'Geçersiz stok. Sadece sayı yaz (örn: 10):');
-            db.seq.product += 1;
-            const product = {
-                id: 'prod' + db.seq.product,
-                name: state.data.name,
-                description: state.data.description || '',
-                price: state.data.price,
-                stock: stock,
-                createdAt: nowIso()
-            };
-            db.products[product.id] = product;
-            logAdmin('urun_ekle', product.name + ' (' + product.id + ') ' + fmtMoney(product.price) + ' x' + product.stock);
-            persist();
-            clearState(chatId);
-            return bot.sendMessage(chatId, '✅ Ürün eklendi!\n\n*' + product.name + '*\n' + (product.description || '') + '\n💵 ' + fmtMoney(product.price) + ' | 📦 Stok: ' + product.stock, { parse_mode: 'Markdown' });
-        }
-
-        case 'admin_editfield_value': {
-            const product = db.products[state.data.productId];
-            if (!product) { clearState(chatId); return bot.sendMessage(chatId, 'Ürün artık mevcut değil.'); }
-            const field = state.data.field;
-            if (field === 'price') {
-                const price = Number(String(text).replace(',', '.').replace(/[^0-9.]/g, ''));
-                if (!price || price <= 0) return bot.sendMessage(chatId, 'Geçersiz fiyat. Tekrar yaz:');
-                product.price = Number(price.toFixed(2));
-            } else if (field === 'stock') {
-                const stock = parseInt(String(text).replace(/[^0-9]/g, ''), 10);
-                if (isNaN(stock) || stock < 0) return bot.sendMessage(chatId, 'Geçersiz stok. Tekrar yaz:');
-                product.stock = stock;
-            } else if (field === 'name') {
-                product.name = text.slice(0, 120);
-            } else if (field === 'description') {
-                product.description = text === '-' ? '' : text.slice(0, 500);
-            }
-            logAdmin('urun_duzenle', product.id + ' / ' + field + ' -> ' + text.slice(0, 80));
-            persist();
-            clearState(chatId);
-            return bot.sendMessage(chatId, '✅ Güncellendi.\n\n*' + product.name + '*\n' + (product.description || '') + '\n💵 ' + fmtMoney(product.price) + ' | 📦 Stok: ' + product.stock, { parse_mode: 'Markdown' });
-        }
-
-        default:
-            clearState(chatId);
-            return;
+    if (!Number.isSafeInteger(amount) || amount < 50 || amount > 100000) {
+      return ctx.reply("Geçersiz tutar. Minimum 50 TL.");
     }
+
+    session.amount = amount;
+    session.step = "receipt";
+
+    return ctx.reply(
+`${BRAND}
+
+🏦 ÖDEME BİLGİLERİ
+
+Alıcı: Resul Sakal
+
+IBAN:
+TR62 0006 2000 5000 0006 8107 73
+
+💰 Ödeme tutarı: ${amount} TL
+
+━━━━━━━━━━━━━━━━━━
+
+Havale yaptıktan sonra dekont fotoğrafını gönder.
+
+Yönetici kontrolünden sonra bakiyen hesabına eklenir.`,
+      backMenu()
+    );
+  }
+});
+
+// RECEIPT
+customerBot.on("photo", async (ctx) => {
+  const session = sessions.get(ctx.from.id);
+
+  if (!session || session.step !== "receipt") {
+    return ctx.reply("Önce bakiye yükleme talebi oluştur.");
+  }
+
+  const amount = session.amount;
+  const user = ctx.from;
+
+  saveUser(user);
+
+  const result = db.prepare(`
+    INSERT INTO payments (user_id, amount, status)
+    VALUES (?, ?, 'pending')
+  `).run(user.id, amount);
+
+  const paymentId = Number(result.lastInsertRowid);
+
+  try {
+    await adminBot.telegram.sendPhoto(
+      adminId,
+      ctx.message.photo[ctx.message.photo.length - 1].file_id,
+      {
+        caption:
+`${BRAND}
+
+💳 YENİ ÖDEME TALEBİ
+
+Talep: #${paymentId}
+Müşteri: ${user.first_name || "Müşteri"}
+Kullanıcı: ${user.username ? "@" + user.username : "Yok"}
+Telegram ID: ${user.id}
+
+💰 Tutar: ${amount} TL`,
+        ...Markup.inlineKeyboard([
+          [
+            Markup.button.callback("✅ ONAYLA", `approve_${paymentId}`),
+            Markup.button.callback("❌ REDDET", `reject_${paymentId}`)
+          ]
+        ])
+      }
+    );
+
+    sessions.delete(user.id);
+
+    await ctx.reply(
+`✅ DEKONTİN YÖNETİCİYE İLETİLDİ
+
+Talep numarası: #${paymentId}
+
+Ödemen kontrol edildikten sonra bakiyen yüklenecek.`,
+      backMenu()
+    );
+  } catch (error) {
+    console.error("Dekont gönderilemedi:", error);
+    await ctx.reply("Dekont iletilemedi. Lütfen @sonpatronn ile iletişime geç.");
+  }
+});
+
+// HISTORY
+customerBot.action("history", async (ctx) => {
+  await ctx.answerCbQuery();
+
+  const rows = db.prepare(`
+    SELECT * FROM transactions
+    WHERE user_id=?
+    ORDER BY id DESC LIMIT 10
+  `).all(ctx.from.id);
+
+  if (!rows.length) {
+    return ctx.reply(
+      "📋 Henüz tamamlanmış işlemin bulunmuyor.",
+      backMenu()
+    );
+  }
+
+  const list = rows.map((row) => {
+    const sign = row.amount >= 0 ? "+" : "";
+    return `#${row.id} | ${row.type === "deposit" ? "Bakiye yükleme" : "İşlem"}\n💰 ${sign}${money(row.amount)}`;
+  }).join("\n\n");
+
+  await ctx.reply(
+`${BRAND}
+
+📋 İŞLEM GEÇMİŞİ
+
+━━━━━━━━━━━━━━━━━━
+
+${list}`,
+    backMenu()
+  );
+});
+
+// ADMIN START
+adminBot.start(async (ctx) => {
+  if (!isAdmin(ctx)) return ctx.reply("⛔ Yetkiniz bulunmuyor.");
+
+  await ctx.reply(
+`${BRAND}
+
+👑 YÖNETİM PANELİ
+
+Hoş geldin yönetici.
+
+Aşağıdaki menüden mağazanı yönetebilirsin.`,
+    Markup.inlineKeyboard([
+      [Markup.button.callback("💳 BEKLEYEN ÖDEMELER", "pending")],
+      [Markup.button.callback("👥 MÜŞTERİLER", "customers")],
+      [Markup.button.callback("📊 İSTATİSTİKLER", "stats")]
+    ])
+  );
+});
+
+// APPROVE
+adminBot.action(/^approve_(\d+)$/, async (ctx) => {
+  if (!isAdmin(ctx)) return ctx.answerCbQuery("Yetkisiz işlem.");
+
+  const id = Number(ctx.match[1]);
+
+  const approve = db.transaction(() => {
+    const payment = db.prepare(
+      "SELECT * FROM payments WHERE id=?"
+    ).get(id);
+
+    if (!payment || payment.status !== "pending") return null;
+
+    db.prepare(`
+      UPDATE payments
+      SET status='approved', reviewed_at=CURRENT_TIMESTAMP
+      WHERE id=?
+    `).run(id);
+
+    db.prepare(`
+      UPDATE users SET balance=balance+? WHERE id=?
+    `).run(payment.amount * 100, payment.user_id);
+
+    db.prepare(`
+      INSERT INTO transactions (user_id, amount, type, reference_id)
+      VALUES (?, ?, 'deposit', ?)
+    `).run(payment.user_id, payment.amount * 100, id);
+
+    return payment;
+  });
+
+  const payment = approve();
+
+  if (!payment) return ctx.answerCbQuery("Bu talep daha önce işlendi.");
+
+  await ctx.answerCbQuery("Ödeme onaylandı.");
+
+  await ctx.editMessageCaption(
+`✅ ÖDEME ONAYLANDI
+
+Talep: #${id}
+Müşteri: ${payment.user_id}
+Tutar: ${payment.amount} TL`
+  ).catch(() => {});
+
+  await ctx.editMessageText(
+`✅ ÖDEME ONAYLANDI
+
+Talep: #${id}
+Müşteri: ${payment.user_id}
+Tutar: ${payment.amount} TL`
+  ).catch(() => {});
+
+  await customerBot.telegram.sendMessage(
+    payment.user_id,
+    `✅ Ödemen onaylandı. ${payment.amount} TL bakiyen hesabına eklendi.`
+  );
+});
+
+// REJECT
+adminBot.action(/^reject_(\d+)$/, async (ctx) => {
+  if (!isAdmin(ctx)) return ctx.answerCbQuery("Yetkisiz işlem.");
+
+  const id = Number(ctx.match[1]);
+
+  const payment = db.prepare(`
+    UPDATE payments
+    SET status='rejected', reviewed_at=CURRENT_TIMESTAMP
+    WHERE id=? AND status='pending'
+    RETURNING *
+  `).get(id);
+
+  if (!payment) return ctx.answerCbQuery("Talep zaten işlenmiş.");
+
+  await ctx.answerCbQuery("Talep reddedildi.");
+
+  await ctx.editMessageCaption(
+    `❌ ÖDEME REDDEDİLDİ\nTalep: #${id}\nTutar: ${payment.amount} TL`
+  ).catch(() => {});
+
+  await customerBot.telegram.sendMessage(
+    payment.user_id,
+    "❌ Ödeme talebin reddedildi. Destek: @sonpatronn"
+  );
+});
+
+// PENDING
+adminBot.action("pending", async (ctx) => {
+  if (!isAdmin(ctx)) return ctx.answerCbQuery("Yetkisiz.");
+
+  await ctx.answerCbQuery();
+
+  const rows = db.prepare(`
+    SELECT * FROM payments
+    WHERE status='pending'
+    ORDER BY id DESC LIMIT 20
+  `).all();
+
+  if (!rows.length) return ctx.reply("Bekleyen ödeme bulunmuyor.");
+
+  for (const p of rows) {
+    await ctx.reply(
+`💳 ÖDEME #${p.id}
+
+Müşteri: ${p.user_id}
+Tutar: ${p.amount} TL`,
+      Markup.inlineKeyboard([
+        [
+          Markup.button.callback("✅ Onayla", `approve_${p.id}`),
+          Markup.button.callback("❌ Reddet", `reject_${p.id}`)
+        ]
+      ])
+    );
+  }
+});
+
+// CUSTOMERS
+adminBot.action("customers", async (ctx) => {
+  if (!isAdmin(ctx)) return ctx.answerCbQuery("Yetkisiz.");
+
+  await ctx.answerCbQuery();
+
+  const users = db.prepare(`
+    SELECT * FROM users ORDER BY created_at DESC LIMIT 30
+  `).all();
+
+  if (!users.length) return ctx.reply("Henüz müşteri bulunmuyor.");
+
+  const list = users.map((u) =>
+    `${u.first_name || "Müşteri"}\nID: ${u.id}\nBakiye: ${money(u.balance)}`
+  ).join("\n\n");
+
+  await ctx.reply(`👥 MÜŞTERİLER\n\n${list}`);
+});
+
+// STATS
+adminBot.action("stats", async (ctx) => {
+  if (!isAdmin(ctx)) return ctx.answerCbQuery("Yetkisiz.");
+
+  await ctx.answerCbQuery();
+
+  const users = db.prepare("SELECT COUNT(*) AS total FROM users").get().total;
+  const pending = db.prepare("SELECT COUNT(*) AS total FROM payments WHERE status='pending'").get().total;
+  const approved = db.prepare("SELECT COALESCE(SUM(amount),0) AS total FROM payments WHERE status='approved'").get().total;
+
+  await ctx.reply(
+`${BRAND}
+
+📊 MAĞAZA İSTATİSTİKLERİ
+
+👥 Müşteri: ${users}
+⏳ Bekleyen ödeme: ${pending}
+💰 Onaylanan yükleme: ${approved} TL`
+  );
+});
+
+// ERRORS
+customerBot.catch((err) => console.error("Müşteri botu:", err));
+adminBot.catch((err) => console.error("Admin botu:", err));
+
+// START
+async function start() {
+  await Promise.all([
+    customerBot.launch(),
+    adminBot.launch()
+  ]);
+
+  console.log("ANKA MARKET müşteri botu aktif.");
+  console.log("ANKA ADMIN botu aktif.");
 }
 
 console.log('ANKA MARKET botu çalışıyor. Versiyon: ' + APP_VERSION);
