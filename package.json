@@ -1,6 +1,5 @@
-
 {
-  "name": "anka-market-bot",
+  "name": "anka-market",
   "version": "1.0.0",
   "description": "ANKA MARKET Telegram Store",
   "main": "server.js",
